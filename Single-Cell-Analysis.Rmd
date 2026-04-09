@@ -1,0 +1,351 @@
+---
+title: "Single-Cell-Analysis"
+author: "Itxaso Alonso"
+date: "2025-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Setting up necessary files/packages
+
+Dataset: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE125620 
+
+-  Molecular basis of neuronal subtype bias introduced by proneural factors Ascl1 and Neurog2 (single-cell RNA-seq)
+- <i>Mus musculus </i>
+- Embryonic bodies exposed to differentiation factors and a Doxycycline treatment for 48 hours.
+
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(readxl)
+library(ggplot2)
+library(rhdf5)
+library(patchwork)
+```
+
+
+### Uploading the raw count matrix
+
+This matrix is in h5 format, we need special packages to upload it.
+
+```{r}
+counts_matrix <- Read10X_h5("data/raw_data/GSM3578982_raw_gene_bc_matrices_h5.h5")
+```
+
+Getting the initial dimensions of the matrix: (genes)x(cel.num)
+
+```{r}
+dim(counts_matrix)
+```
+
+
+### Metadata
+The metadata provided with the experiment dataset doesn't correspond to each cell, it is related only to the experiment. As a result we can't add it to the Seurat object in a regular way. 
+
+```{r}
+metadata <- read.csv("data/raw_data/SraRunTable.csv", row.names = 1)
+print(metadata)
+```
+
+
+
+### Seurat object creation
+
+```{r}
+seurat_obj <- CreateSeuratObject(counts = counts_matrix)
+```
+
+As it was previously explained, we don't have a real metadata file. We will add manually the available metadata useful for our analysis. 
+
+```{r}
+seurat_obj$sample <- "GSM3578982"
+seurat_obj$run <- "SRR8485394-97"
+seurat_obj$condition <- "Dox induction + 48 hours"
+seurat_obj$cell_type <- "ES-derived embryoid bodies with induced transcription factors"
+seurat_obj$species <- "Mus musculus"
+
+#See the result
+seurat_obj
+head(seurat_obj@meta.data)
+
+```
+
+
+### Filtering and normalizing
+
+<i> 28694 features across 737280 samples </i> this indicates that a huge number of genes have 0 counts in some cells, it's necessary to do the filtering, normalization and scaling. 
+
+```{r}
+erccs <- grep("^ERCC-", rownames(seurat_obj), value = TRUE)
+
+if (length(erccs) > 0) {
+
+  counts <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+
+  percent.ercc <- Matrix::colSums(counts[erccs, , drop = FALSE]) /
+                  Matrix::colSums(counts)
+
+  seurat_obj <- AddMetaData(seurat_obj, percent.ercc, col.name = "percent.ercc")
+}
+#Our dataset is already filtered for ERC, but just in case we apply the filtering
+
+#Filtering: erasing low quality cells and outliers (doublets, too high expression)
+seurat_obj <- subset(
+  seurat_obj,
+  subset =
+    nFeature_RNA > 500 &
+    nFeature_RNA < 8000 &
+    nCount_RNA > 5000 &
+    nCount_RNA < 60000
+)
+
+
+
+#Normalization
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+# Variable genes
+seurat_obj <- FindVariableFeatures(seurat_obj)
+
+# Scaling
+seurat_obj <- ScaleData(seurat_obj)
+
+dim(seurat_obj)
+```
+
+### Violin plots: QC
+
+```{r}
+p <- VlnPlot(
+  seurat_obj,
+  features = c("nFeature_RNA", "nCount_RNA"),
+  ncol = 2
+)
+
+p & theme(
+  axis.title.x = element_blank(),
+  axis.text.x  = element_blank(),
+  axis.ticks.x = element_blank()
+)
+
+```
+
+```{r}
+seurat_obj <- FindVariableFeatures(object = seurat_obj)
+top10 <- head(VariableFeatures(seurat_obj), 10)
+plot1 <- VariableFeaturePlot(seurat_obj)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+
+### PCA
+
+```{r}
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(seurat_obj))
+ElbowPlot(seurat_obj, ndims = 50)
+```
+
+
+- More in detail analysis of PCs:
+
+```{r}
+DimHeatmap(seurat_obj, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+<b> We choose 25 as the number of significant PC to use for the subsequent UMAP. </b>
+
+
+### Clustering and UMAP
+
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:25)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+
+# ----- UMAP -----
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:25)
+
+#Number of clusters
+levels(seurat_obj)  
+```
+
+
+```{r}
+DimPlot(seurat_obj, reduction = "umap", group.by = "sample")
+```
+
+```{r}
+DimPlot(seurat_obj, reduction = "umap", label = TRUE)
+```
+
+### Markers
+
+We will save the top markers for each cluster in order to identify the different cell types present in our dataset. 
+
+```{r}
+markers <- FindAllMarkers(seurat_obj,
+                          only.pos = TRUE,
+                          min.pct = 0.25,
+                          logfc.threshold = 0.25)
+
+top_markers <- markers %>% group_by(cluster) %>% top_n(5, avg_log2FC)
+print(top_markers)
+
+sel <- dplyr::select(top_markers, cluster, gene)
+
+sel$gene <- toupper(sel$gene)
+
+
+```
+
+
+Based on literature we set the following labels:
+
+```{r}
+seurat_obj <- RenameIdents(seurat_obj,
+                           `0` = "Early neural progenitors/Radial‑glia–like",
+                           `1` = "Sensory/Dorsal interneurons Tlx3+",
+                           `2` = "Dorsal interneurons/Sensory neuroblast",
+                           `3` = "Mitotic/Proliferating progenitors",
+                           `4` = "Mesenchymal-like/Intermediate Progenitors",
+                           `5` = "Immature/Post‑mitotic glutamatergic neurons",
+                           `6` = "Autonomic Neurons")
+
+
+DimPlot(seurat_obj, reduction = "umap", label.size = 3) + 
+  labs(title = "Cell type prediction") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),  
+    legend.text = element_text(size = 8),                               
+    legend.title = element_text(size = 10),
+    aspect.ratio = 0.7                                                 
+  )
+```
+
+### NEUROG2 visualization
+
+<b> How is the gene's expression distributed in our data? </b>
+
+```{r}
+FeaturePlot(seurat_obj, features = "Neurog2", label = TRUE, repel = T, label.size = 3)
+
+ VlnPlot(seurat_obj, features = "Neurog2") +
+  theme(
+    plot.margin = margin(20, 20, 20, 20),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 10)
+  )
+
+ FeaturePlot(seurat_obj, features = "Ascl1", label = TRUE, repel = T, label.size = 3)
+ 
+ #VGLUT2 expression for the glutamatergic identity confirmation. 
+  FeaturePlot(seurat_obj, features = "Slc17a6", label = TRUE, repel = T, label.size = 3)
+
+```
+- Violin plot
+
+Neurog2 expression levels were detected in all the 6 clusters or cell types included in our dataset, which is related to Neurog2’s central paper in neuronal fate determination in early development stages. However, Mesenchymal-like / Intermediate progenitors, Dorsal interneurons / Sensory neuroblasts and Immature / Post-mitotic glutamatergic neurons showed higher expression levels, Figure 16. Neurog2 is  TF necessary for glutamatergic and sensory neuron development, triggering the subtype specification of the neuroblasts.
+Nonetheless, the Tlx3+ positive cluster, a marker for glutamatergic neurons, showed little to no expression of Neurog2. In addition, the Dorsal Interneuron cluster, positive for GABAergic neuron markers, showed high expression of Neurog2. The TF is not only responsible for the glutamatergic phenotype development, it is also necessary for the GABA subtype specification inhibition. 
+This seems to be related to the experimental model origin of the data, stem cells lack the complex signalling pathways present in early development stages. Furthermore, embryonic bodies have limited ability to develop different cell subtypes.
+
+### Gene co-expression
+
+Based on the results obtained from the ChIP-Seq significant genes were selected, the sequences where Neurog2 acts. Some of the most significant genes were selected, selecting the biggest values in the V5 column, corresponding to the -log(p-value). 
+
+```{r}
+chip<- read.table("data/raw_data/CHIPIP1_summits_resized_annotation_mm10.tsv",
+                 header = TRUE,
+                 sep = "\t",
+                 check.names = FALSE)
+sum(duplicated(chip[,1]))
+
+head(chip)
+
+```
+
+
+
+
+### Most significant in Single-Cell and ChIP-seq
+
+Using the markers extracted from the Single-cell analysis, the ones with a significant p-value, and a logFC bigger than 0.25 (logfc.threshold = 0.25), we overlapped the significant genes from the ChIP-Seq analysis. 
+We expect a coexpression of these genes with NeuroG2.
+
+- <b> We expect them to be expressed in the same clusters (aprox.) </b>
+
+```{r}
+#Only saving the gene name and -log(p-value)
+#For the gene name we will use the ENSEMBL ID, to make sure the same gene ID is contained in the chip and seurat object
+chip_ids <- chip[, c("ENSEMBL", "V5")]
+chip_ids <- chip_ids[!is.na(chip_ids$ENSEMBL), ]
+library(biomaRt)
+
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+mapping <- getBM(
+    attributes = c("ensembl_gene_id", "mgi_symbol"),
+    filters = "ensembl_gene_id",
+    values = unique(chip_ids$ENSEMBL),
+    mart = mart
+)
+
+chip_mapped <- merge(
+    chip_ids,
+    mapping,
+    by.x = "ENSEMBL",
+    by.y = "ensembl_gene_id",
+    all.x = TRUE
+)
+
+mark<- markers[, c("p_val_adj", "gene", "avg_log2FC")]
+#Once we ensured same gene notation we can overlap the significant markers with the chipseq results
+#overlap <- chip_mapped[chip_mapped$mgi_symbol %in% markers$gene, ]
+overlap <- merge(
+  x = mark, 
+  y = chip_mapped, 
+  by.x = "gene", 
+  by.y = "mgi_symbol",
+  all = FALSE
+)
+overlap <- overlap[order(-overlap$V5), ]
+head(overlap)
+
+
+highV5 <- quantile(overlap$V5, 0.75)          # top 25%
+highFC <- quantile(overlap$avg_log2FC, 0.75)  # top 25%
+
+strong_overlap <- overlap[
+  overlap$V5 >= highV5 & overlap$avg_log2FC >= highFC, 
+]
+
+strong_overlap
+```
+
+
+```{r}
+
+FeaturePlot(seurat_obj, features = "Enc1", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Pou4f1", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Btbd17", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Olig3", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Tead1", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Neurod2", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Celf4", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Phf24", label = TRUE, repel = T, label.size = 3)
+FeaturePlot(seurat_obj, features = "Epha4", label = TRUE, repel = T, label.size = 3)
+
+```
+
+
+Four genes were selected finally selected from the overlapped dataset, more specifically Enc1, which showed the most significant peak in the ChIP-Seq analysis, Epha4,  Pou4f1 and Neurod2.
+
+A really specific expression was expected, but not all target genes appear to be specific to Neurog2, by the generalized expression observed, for instance, in the case of the Enc1 or Epha4 gene. However, given the essential function of the genes the generalized expression of both is completely logical. Enc1, cell proliferation, differentiation, and apoptosis regulator, and Epha4, necessary for synaptogenesis and synaptic plasticity, vital functions for this type of cells. 
+On the other hand, Pou4f1, TF downstream of the Neurog2 pathway, and Neurod2, whose transcription is directly activated by Neurog2, showed a focused co-expression with the TF, confirming the initial hypothesis. Nevertheless, both show relatively low expression levels, lower than what was expected based on the relation of the TF. This suggests that additional transcription factors may also regulate these genes. We propose that, as in many other biological processes, Neurog2 likely cooperates with other proteins to activate its target genes. Therefore, Neurog2 may be essential for the transcription of the genes identified in our ChIP-seq analysis, but not independent. Furthermore, it could be one of several factors contributing to their activation, and perhaps not the primary one. 
+Additionally, the shortcomings of the experimental set up should be considered, as some signalling components may be missing. It has been proven that slight modifications in different molecule concentrations can completely modify Neurog2’s function, for instance small BMP2 concentrations can trigger the formation of sensory neurons during differentiation of neural tube cultures, while high concentrations will activate the autonomic neuronal fate. This could explain the differences observed from what was initially thought. 
